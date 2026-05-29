@@ -12,9 +12,9 @@
 
 // ICO file format structures
 typedef struct __attribute__((packed)) {
-  uint16_t reserved;  // Must be 0
-  uint16_t type;      // 1 for ICO, 2 for CUR
-  uint16_t count;     // Number of images
+  uint16_t reserved; // Must be 0
+  uint16_t type;     // 1 for ICO, 2 for CUR
+  uint16_t count;    // Number of images
 } IconDir;
 
 typedef struct __attribute__((packed)) {
@@ -133,7 +133,8 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
   uint32_t offset = entry->image_offset;
   uint32_t size = entry->bytes_in_res;
 
-  if (offset + size > ico_len) {
+  // Check bounds without overflowing uint32_t
+  if (offset > ico_len || size > (uint32_t) (ico_len - offset)) {
     err = js_throw_error(env, NULL, "Invalid ICO file: image data out of bounds");
     assert(err == 0);
     return NULL;
@@ -142,8 +143,7 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
   uint8_t *img_data = ico_data + offset;
 
   // Check if PNG (magic: 0x89 0x50 0x4E 0x47)
-  bool is_png = (size >= 8 && img_data[0] == 0x89 && img_data[1] == 0x50 &&
-                 img_data[2] == 0x4E && img_data[3] == 0x47);
+  bool is_png = (size >= 8 && img_data[0] == 0x89 && img_data[1] == 0x50 && img_data[2] == 0x4E && img_data[3] == 0x47);
 
   int width, height, channels;
   uint8_t *rgba_data = NULL;
@@ -177,8 +177,10 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
     memcpy(&bmp_bpp, img_data + 14, 2);
     memcpy(&bmp_compression, img_data + 16, 4);
 
-    // Validate
-    if (header_size < 40 || bmp_width <= 0 || bmp_height <= 0) {
+    // Validate. Cap dimensions to keep all downstream size math within int32.
+    // 65535 is well above any realistic ICO image and prevents overflow in
+    // row_size / pixel_data_size / rgba_size calculations below.
+    if (header_size < 40 || bmp_width <= 0 || bmp_height <= 0 || bmp_width > 65535 || bmp_height > 131070) {
       err = js_throw_error(env, NULL, "Invalid BMP-in-ICO header");
       assert(err == 0);
       return NULL;
@@ -187,27 +189,37 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
     // ICO BMP height is doubled (image data + AND mask)
     int32_t actual_height = bmp_height / 2;
 
-    // Calculate row size (must be multiple of 4)
-    int row_size = ((bmp_width * bmp_bpp + 31) / 32) * 4;
-    int pixel_data_size = row_size * actual_height;
+    // Compute sizes in 64-bit to detect any wrap before we trust them.
+    int64_t row_size_64 = (((int64_t) bmp_width * bmp_bpp + 31) / 32) * 4;
+    int64_t pixel_data_size_64 = row_size_64 * actual_height;
+    int64_t rgba_size_64 = (int64_t) bmp_width * actual_height * 4;
+
+    // Palette size (only present for <=8bpp)
+    int palette_size = (bmp_bpp <= 8) ? (1 << bmp_bpp) * 4 : 0;
+
+    // Verify palette + pixel data lie entirely within the input image.
+    if ((int64_t) header_size + palette_size > (int64_t) size || pixel_data_size_64 > (int64_t) size - header_size - palette_size) {
+      err = js_throw_error(env, NULL, "Invalid BMP-in-ICO: pixel data out of bounds");
+      assert(err == 0);
+
+      return NULL;
+    }
+
+    int row_size = (int) row_size_64;
 
     // Allocate output RGBA buffer
     width = bmp_width;
     height = actual_height;
-    rgba_data = (uint8_t *)malloc(width * height * 4);
+    rgba_data = (uint8_t *) malloc((size_t) rgba_size_64);
     if (!rgba_data) {
       err = js_throw_error(env, NULL, "Memory allocation failed");
       assert(err == 0);
+
       return NULL;
     }
 
-    // Find pixel data start (after header and color palette if present)
-    uint8_t *pixel_start = img_data + header_size;
-    if (bmp_bpp <= 8) {
-      // Has color palette
-      int palette_size = (1 << bmp_bpp) * 4;
-      pixel_start += palette_size;
-    }
+    // Pixel data starts after header and (optional) color palette
+    uint8_t *pixel_start = img_data + header_size + palette_size;
 
     // Decode based on bit depth
     if (bmp_bpp == 32 && bmp_compression == 0) {
@@ -231,7 +243,7 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
           dst[x * 4 + 0] = src[x * 3 + 2]; // R
           dst[x * 4 + 1] = src[x * 3 + 1]; // G
           dst[x * 4 + 2] = src[x * 3 + 0]; // B
-          dst[x * 4 + 3] = 255;             // A
+          dst[x * 4 + 3] = 255;            // A
         }
       }
     } else if (bmp_bpp == 8 && bmp_compression == 0) {
@@ -245,7 +257,7 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
           dst[x * 4 + 0] = palette[index * 4 + 2]; // R
           dst[x * 4 + 1] = palette[index * 4 + 1]; // G
           dst[x * 4 + 2] = palette[index * 4 + 0]; // B
-          dst[x * 4 + 3] = 255;                     // A
+          dst[x * 4 + 3] = 255;                    // A
         }
       }
     } else if (bmp_bpp == 4 && bmp_compression == 0) {
@@ -265,7 +277,7 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
           dst[x * 4 + 0] = palette[index * 4 + 2]; // R
           dst[x * 4 + 1] = palette[index * 4 + 1]; // G
           dst[x * 4 + 2] = palette[index * 4 + 0]; // B
-          dst[x * 4 + 3] = 255;                     // A (opaque)
+          dst[x * 4 + 3] = 255;                    // A (opaque)
         }
       }
     } else {
@@ -304,8 +316,15 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
   err = js_set_named_property(env, result, "height", height_val);
   assert(err == 0);
 
-  // Set data
-  size_t data_len = width * height * 4;
+  // Set data. Use size_t arithmetic to avoid int overflow on the PNG path
+  // where width/height come from stb_image and are not pre-bounded here.
+  if (width <= 0 || height <= 0) {
+    stbi_image_free(rgba_data);
+    err = js_throw_error(env, NULL, "Invalid decoded image dimensions");
+    assert(err == 0);
+    return NULL;
+  }
+  size_t data_len = (size_t) width * (size_t) height * 4;
   uint8_t *result_data = malloc(data_len);
   if (!result_data) {
     stbi_image_free(rgba_data);
