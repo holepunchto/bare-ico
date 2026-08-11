@@ -87,6 +87,31 @@ test('rejects 8-bit BMP-in-ICO with undersized palette region', (t) => {
   t.exception(() => ico.decode(buf))
 })
 
+test('decodes a 32-bit BMP-in-ICO', (t) => {
+  const result = ico.decode(bmpInIco({ width: 2, height: 2, bpp: 32 }))
+
+  t.is(result.width, 2)
+  t.is(result.height, 2)
+})
+
+test('decodes an 8-bit BMP-in-ICO', (t) => {
+  const result = ico.decode(
+    bmpInIco({ width: 2, height: 2, bpp: 8, palette: Buffer.alloc(256 * 4) })
+  )
+
+  t.is(result.width, 2)
+  t.is(result.height, 2)
+})
+
+test('rejects BMP-in-ICO with unsupported bit depth', (t) => {
+  // Valid header + in-bounds pixel data but bpp = 16 reaches the rgba_data
+  // allocation, then the unsupported-format branch that must free(rgba_data).
+  t.exception(
+    () => ico.decode(bmpInIco({ width: 2, height: 2, bpp: 16 })),
+    /Unsupported BMP format/
+  )
+})
+
 test('rejects ICO entry with offset+size that wraps uint32', (t) => {
   // image_offset + bytes_in_res wraps in uint32: 0xFFFFFFFE + 4 = 2, which
   // pre-fix bypassed the `offset + size > ico_len` bounds check.
@@ -101,3 +126,35 @@ test('rejects ICO entry with offset+size that wraps uint32', (t) => {
 
   t.exception(() => ico.decode(buf))
 })
+
+// Helpers
+
+// Build a single-entry ICO wrapping a BMP-in-ICO image. `height` is the real
+// image height; the DIB header stores it doubled (image + AND mask).
+function bmpInIco({ width, height, bpp, palette = Buffer.alloc(0), pixels }) {
+  const headerSize = 40
+  const rowSize = Math.floor((width * bpp + 31) / 32) * 4
+  const pixelData = pixels ?? Buffer.alloc(rowSize * height)
+  const bmp = Buffer.concat([Buffer.alloc(headerSize), palette, pixelData])
+
+  bmp.writeUInt32LE(headerSize, 0)
+  bmp.writeInt32LE(width, 4)
+  bmp.writeInt32LE(height * 2, 8)
+  bmp.writeUInt16LE(1, 12)
+  bmp.writeUInt16LE(bpp, 14)
+  bmp.writeUInt32LE(0, 16)
+
+  const buf = Buffer.alloc(6 + 16 + bmp.length)
+  buf.writeUInt16LE(0, 0)
+  buf.writeUInt16LE(1, 2)
+  buf.writeUInt16LE(1, 4)
+  buf[6] = width & 0xff
+  buf[7] = (height * 2) & 0xff
+  buf.writeUInt16LE(1, 10)
+  buf.writeUInt16LE(bpp, 12)
+  buf.writeUInt32LE(bmp.length, 14)
+  buf.writeUInt32LE(22, 18)
+  bmp.copy(buf, 22)
+
+  return buf
+}
