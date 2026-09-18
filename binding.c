@@ -10,6 +10,8 @@
 #define STBI_NO_STDIO
 #include "stb_image.h"
 
+#define BARE_ICO_MAX_PIXELS (1ull << 28)
+
 // ICO file format structures
 typedef struct __attribute__((packed)) {
   uint16_t reserved; // Must be 0
@@ -31,6 +33,15 @@ typedef struct __attribute__((packed)) {
 static void
 bare_ico__on_finalize(js_env_t *env, void *data, void *finalize_hint) {
   free(data);
+}
+
+static void
+bare_ico__free(uint8_t *data, bool from_stbi) {
+  if (from_stbi) {
+    stbi_image_free(data);
+  } else {
+    free(data);
+  }
 }
 
 /**
@@ -147,12 +158,15 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
 
   int width, height, channels;
   uint8_t *rgba_data = NULL;
+  bool from_stbi = false;
 
   if (is_png) {
     // PNG format - can decode directly
     rgba_data = stbi_load_from_memory(
       img_data, size, &width, &height, &channels, 4
     );
+
+    from_stbi = true;
   } else {
     // BMP-in-ICO format: has DIB header but no BITMAPFILEHEADER
     // Height is doubled (includes AND mask)
@@ -205,7 +219,14 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
       return NULL;
     }
 
-    int row_size = (int) row_size_64;
+    if (rgba_size_64 > (int64_t) BARE_ICO_MAX_PIXELS * 4) {
+      err = js_throw_error(env, NULL, "BMP-in-ICO dimensions exceed maximum");
+      assert(err == 0);
+
+      return NULL;
+    }
+
+    size_t row_size = (size_t) row_size_64;
 
     // Allocate output RGBA buffer
     width = bmp_width;
@@ -225,8 +246,8 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
     if (bmp_bpp == 32 && bmp_compression == 0) {
       // 32-bit RGBA - direct copy with BGR→RGB conversion
       for (int y = 0; y < actual_height; y++) {
-        uint8_t *src = pixel_start + ((actual_height - 1 - y) * row_size);
-        uint8_t *dst = rgba_data + (y * width * 4);
+        uint8_t *src = pixel_start + (size_t) (actual_height - 1 - y) * row_size;
+        uint8_t *dst = rgba_data + (size_t) y * width * 4;
         for (int x = 0; x < width; x++) {
           dst[x * 4 + 0] = src[x * 4 + 2]; // R
           dst[x * 4 + 1] = src[x * 4 + 1]; // G
@@ -237,8 +258,8 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
     } else if (bmp_bpp == 24 && bmp_compression == 0) {
       // 24-bit RGB - convert to RGBA
       for (int y = 0; y < actual_height; y++) {
-        uint8_t *src = pixel_start + ((actual_height - 1 - y) * row_size);
-        uint8_t *dst = rgba_data + (y * width * 4);
+        uint8_t *src = pixel_start + (size_t) (actual_height - 1 - y) * row_size;
+        uint8_t *dst = rgba_data + (size_t) y * width * 4;
         for (int x = 0; x < width; x++) {
           dst[x * 4 + 0] = src[x * 3 + 2]; // R
           dst[x * 4 + 1] = src[x * 3 + 1]; // G
@@ -250,8 +271,8 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
       // 8-bit indexed color - use palette
       uint8_t *palette = img_data + header_size;
       for (int y = 0; y < actual_height; y++) {
-        uint8_t *src = pixel_start + ((actual_height - 1 - y) * row_size);
-        uint8_t *dst = rgba_data + (y * width * 4);
+        uint8_t *src = pixel_start + (size_t) (actual_height - 1 - y) * row_size;
+        uint8_t *dst = rgba_data + (size_t) y * width * 4;
         for (int x = 0; x < width; x++) {
           uint8_t index = src[x];
           dst[x * 4 + 0] = palette[index * 4 + 2]; // R
@@ -264,8 +285,8 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
       // 4-bit indexed color - use palette
       uint8_t *palette = img_data + header_size;
       for (int y = 0; y < actual_height; y++) {
-        uint8_t *src = pixel_start + ((actual_height - 1 - y) * row_size);
-        uint8_t *dst = rgba_data + (y * width * 4);
+        uint8_t *src = pixel_start + (size_t) (actual_height - 1 - y) * row_size;
+        uint8_t *dst = rgba_data + (size_t) y * width * 4;
         for (int x = 0; x < width; x++) {
           uint8_t byte = src[x / 2];
           uint8_t index;
@@ -318,8 +339,8 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
 
   // Set data. Use size_t arithmetic to avoid int overflow on the PNG path
   // where width/height come from stb_image and are not pre-bounded here.
-  if (width <= 0 || height <= 0) {
-    stbi_image_free(rgba_data);
+  if (width <= 0 || height <= 0 || (uint64_t) width * height > BARE_ICO_MAX_PIXELS) {
+    bare_ico__free(rgba_data, from_stbi);
     err = js_throw_error(env, NULL, "Invalid decoded image dimensions");
     assert(err == 0);
     return NULL;
@@ -327,14 +348,14 @@ bare_ico_decode(js_env_t *env, js_callback_info_t *info) {
   size_t data_len = (size_t) width * (size_t) height * 4;
   uint8_t *result_data = malloc(data_len);
   if (!result_data) {
-    stbi_image_free(rgba_data);
+    bare_ico__free(rgba_data, from_stbi);
     err = js_throw_error(env, NULL, "Memory allocation failed");
     assert(err == 0);
     return NULL;
   }
 
   memcpy(result_data, rgba_data, data_len);
-  stbi_image_free(rgba_data);
+  bare_ico__free(rgba_data, from_stbi);
 
   js_value_t *buffer;
   err = js_create_external_arraybuffer(
