@@ -5,14 +5,7 @@ find_package(cmake-fetch REQUIRED PATHS node_modules/cmake-fetch)
 
 project(bare_ico C)
 
-# Fetch stb_image.h for robust image decoding
-include(FetchContent)
-FetchContent_Declare(
-  stb
-  URL https://github.com/nothings/stb/archive/refs/heads/master.zip
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-FetchContent_MakeAvailable(stb)
+fetch_package("github:nothings/stb#802cd45" SOURCE_DIR stb)
 
 add_bare_module(bare_ico)
 
@@ -25,5 +18,5 @@ target_sources(
 target_include_directories(
   ${bare_ico}
   PRIVATE
-    ${stb_SOURCE_DIR}
+    ${stb}
 )
